@@ -14,15 +14,15 @@ x-airflow-common: &airflow-common
     PYTHONPATH: /opt/airflow
     MONGO_URI: mongodb://mongo:27017
     KBO_DATA_DIR: /data/kbo
-    BRONZE_ROOT: /bronze
-    HDFS_WEBHDFS_URL: http://namenode:9870
+    BRONZE_ROOT: /opt/airflow/bronze
+    HDFS_WEBHDFS_URL: ""
     TOR_SOCKS_HOST: tor
     TOR_CONTROL_HOST: tor
   volumes:
     - ./dags:/opt/airflow/dags
     - ./src/bce:/opt/airflow/bce
     - ${KBO_HOST_PATH}:/data/kbo:ro
-    - bronze_data:/bronze
+    - ./bronze:/opt/airflow/bronze
   depends_on:
     postgres:
       condition: service_healthy
@@ -88,10 +88,12 @@ services:
     <<: *airflow-common
     command: webserver
     ports:
-      - "8080:8080"
+      - "8082:8080"
     depends_on:
       airflow-init:
         condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
 
   airflow-scheduler:
     <<: *airflow-common
@@ -99,6 +101,8 @@ services:
     depends_on:
       airflow-init:
         condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
 
 volumes:
   mongo_data:
