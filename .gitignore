@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.env
+.pytest_cache/
+dist/
+build/
+
+# Bronze local (hors volume Docker)
+bronze/
+
+# Données KBO (montées depuis notebook solo/data, pas versionnées)
+data/
