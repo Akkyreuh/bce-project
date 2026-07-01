@@ -9,12 +9,15 @@ Transformations actuelles :
 
 from __future__ import annotations
 
+import csv
 from datetime import datetime, timezone
-from typing import Any
+from pathlib import Path
+from typing import Any, Iterator
 
 from pymongo import ASCENDING, MongoClient, UpdateOne
 
 from bce import config
+from bce.utils import normalize_bce
 
 SOURCE_COLLECTION = "enterprises"
 SILVER_COLLECTION = "entreprise_silver"
@@ -85,6 +88,85 @@ def build_silver(batch_size: int = 5000, limit: int | None = None) -> dict:
         "processed": processed,
         "silver_count": dst.count_documents({}),
         "start_date_null": date_null,
+    }
+    client.close()
+    return stats
+
+
+#Activités NACE
+
+
+def dedup_activities(rows: list[dict]) -> list[dict]:
+    seen: set[tuple[str, str]] = set()
+    out: list[dict] = []
+    for r in rows:
+        code = (r.get("NaceCode") or "").strip()
+        classification = (r.get("Classification") or "").strip()
+        if not code:
+            continue
+        key = (code, classification)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({
+            "nace_code": code,
+            "classification": classification,
+            "nace_version": (r.get("NaceVersion") or "").strip() or None,
+            "activity_group": (r.get("ActivityGroup") or "").strip() or None,
+        })
+    return out
+
+
+def _iter_entity_groups(activity_path: Path) -> Iterator[tuple[str, list[dict]]]:
+    """Streame activity.csv (trié par EntityNumber) et yield (entity, lignes)."""
+    with open(activity_path, encoding="utf-8-sig", newline="") as f:
+        current: str | None = None
+        buf: list[dict] = []
+        for row in csv.DictReader(f):
+            ent = row["EntityNumber"]
+            if current is None:
+                current = ent
+            if ent != current:
+                yield current, buf
+                current, buf = ent, []
+            buf.append(row)
+        if current is not None and buf:
+            yield current, buf
+
+
+def build_activities(kbo_dir: str | None = None, batch_size: int = 5000) -> dict:
+    """Embarque un tableau `activities` dédupliqué dans chaque doc silver existant."""
+    activity_path = Path(kbo_dir or config.KBO_DATA_DIR) / "activity.csv"
+    if not activity_path.is_file():
+        raise FileNotFoundError(f"Missing {activity_path}")
+
+    client = MongoClient(config.MONGO_URI)
+    dst = client[config.MONGO_CATALOG_DB][SILVER_COLLECTION]
+
+    now = datetime.now(timezone.utc)
+    entities = matched = total_acts = 0
+    ops: list[UpdateOne] = []
+    for entity, rows in _iter_entity_groups(activity_path):
+        acts = dedup_activities(rows)
+        if not acts:
+            continue
+        entities += 1
+        total_acts += len(acts)
+        bce = normalize_bce(entity)
+        ops.append(UpdateOne(
+            {"bce_number": bce},
+            {"$set": {"activities": acts, "activities_updated_at": now}},
+        ))
+        if len(ops) >= batch_size:
+            matched += dst.bulk_write(ops, ordered=False).matched_count
+            ops = []
+    if ops:
+        matched += dst.bulk_write(ops, ordered=False).matched_count
+
+    stats = {
+        "entities_with_activities": entities,
+        "matched_in_silver": matched,
+        "activities_embedded": total_acts,
     }
     client.close()
     return stats
