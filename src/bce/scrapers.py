@@ -334,18 +334,26 @@ KBO_BASE = "https://kbopub.economie.fgov.be/kbopub"
 class KBOWebScraper:
     def __init__(self, use_tor: bool = False):
         self.use_tor = use_tor
-        self.session = _http_session(use_tor)
+        self._proxy = playwright_proxy() if use_tor else None
 
     def fetch_external_links(self, bce_number: str) -> dict[str, str]:
+        # kbopub bloque les requêtes non-navigateur (503) → passage par Playwright
+        from playwright.sync_api import sync_playwright
+
         n = normalize_bce(bce_number)
-        r = self.session.get(
-            f"{KBO_BASE}/toonondernemingps.html",
-            params={"lang": "fr", "ondernemingsnummer": n},
-            timeout=60,
-            proxies=requests_proxies() if self.use_tor else None,
-        )
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "lxml")
+        with sync_playwright() as p:
+            browser = _launch_browser(p, self._proxy)
+            ctx = _browser_context(browser, self._proxy)
+            page = ctx.new_page()
+            page.goto(
+                f"{KBO_BASE}/toonondernemingps.html?lang=fr&ondernemingsnummer={n}",
+                wait_until="domcontentloaded",
+                timeout=120000,
+            )
+            page.wait_for_timeout(1500)
+            html = page.content()
+            browser.close()
+        soup = BeautifulSoup(html, "lxml")
         return {a.get_text(" ", strip=True): a["href"] for a in soup.select("div#table a.external")}
 
     def get_moniteur_url(self, bce_number: str) -> str | None:

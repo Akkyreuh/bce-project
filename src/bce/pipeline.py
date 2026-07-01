@@ -12,11 +12,26 @@ from bce.scrapers import (
     EJusticeScraper,
     KBOWebScraper,
     StaporScraper,
+    is_valid_csv_bytes,
     renew_tor_identity,
 )
 from bce.state import ArtifactStore, BronzeStorage, build_artifact_key, sha256_bytes
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_download(artifact_type: str, data: bytes) -> str | None:
+    """Retourne un message d'erreur si le contenu n'est pas l'artefact attendu, sinon None."""
+    if not data or len(data) < 100:
+        return f"réponse trop courte ({len(data)} octets)"
+    head = data.lstrip()[:20]
+    if head[:1] == b"{" or head.startswith(b"<!") or head.lower().startswith(b"<html"):
+        return "réponse non-binaire (erreur JSON/HTML)"
+    if artifact_type.endswith("pdf") and not data[:5].startswith(b"%PDF"):
+        return "PDF invalide (pas d'en-tête %PDF)"
+    if artifact_type == "csv" and not is_valid_csv_bytes(data):
+        return "CSV invalide"
+    return None
 
 
 class BronzePipeline:
@@ -102,6 +117,10 @@ class BronzePipeline:
                 path = self.storage.bronze_path_ejustice(bce, doc["publication_numac"])
             else:
                 self.state.mark_error(key, f"Unknown source {source}")
+                return False
+            err = _validate_download(doc["artifact_type"], data)
+            if err:
+                self.state.mark_error(key, err)
                 return False
             written = self.storage.write(path, data)
             self.state.mark_done(key, hdfs_path=written, checksum_sha256=sha256_bytes(data), file_size=len(data))
