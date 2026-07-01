@@ -1,6 +1,22 @@
-"""Configuration via variables d'environnement."""
+"""Configuration via variables d'environnement (charge .env à la racine si présent)."""
 
 import os
+from pathlib import Path
+
+
+def _load_dotenv() -> None:
+    p = Path(__file__).resolve().parents[2] / ".env"
+    if not p.is_file():
+        return
+    for line in p.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+_load_dotenv()
 
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 MONGO_CATALOG_DB = os.getenv("MONGO_CATALOG_DB", "bce_catalog")
