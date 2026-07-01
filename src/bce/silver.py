@@ -1,10 +1,16 @@
-"""Silver layer — transformations propres du catalogue bronze → `entreprise_silver`.
+"""Silver layer — transformations propres du bronze mergé → `entreprise_silver`.
 
-Lit la collection source `enterprises` (jamais modifiée) et écrit les documents
-transformés dans `entreprise_silver`. Chaque transformation s'ajoute dans `to_silver()`.
+Le bronze (`enterprises`) contient déjà toutes les infos liées (denominations, adresse,
+contacts, activités brutes, établissements), mergées depuis les CSV KBO. La silver ne fait
+que TRANSFORMER, sans re-joindre de source :
 
-Transformations actuelles :
-  - start_date : DD-MM-YYYY → YYYY-MM-DD (garde l'original dans start_date_raw)
+  1. start_date     : DD-MM-YYYY → YYYY-MM-DD (raw conservé dans start_date_raw)
+  2. adresse        : on ne garde que TypeOfAddress = REGO (siège social)
+  3. denominations  : dénomination officielle (type 001) en premier, autres ensuite
+  4. codes → labels : statut / forme / situation / type / NACE → libellés FR (code.csv),
+                      codes bruts conservés pour filtre/index
+  5. activités      : dédup (NaceCode + Classification), toutes versions confondues
+  6. établissements : start_date normalisée
 """
 
 from __future__ import annotations
@@ -12,15 +18,17 @@ from __future__ import annotations
 import csv
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from pymongo import ASCENDING, MongoClient, UpdateOne
 
 from bce import config
-from bce.utils import normalize_bce
 
 SOURCE_COLLECTION = "enterprises"
 SILVER_COLLECTION = "entreprise_silver"
+
+NACE_CATEGORY = {"2025": "Nace2025", "2008": "Nace2008", "2003": "Nace2003"}
+OFFICIAL_DENOMINATION = "001"
 
 
 def normalize_start_date(value: Any) -> str | None:
@@ -43,17 +51,93 @@ def normalize_start_date(value: Any) -> str | None:
         return None
 
 
-def to_silver(doc: dict) -> dict:
-    """Transforme un document source en document silver."""
-    out = dict(doc)
-    out.pop("_id", None)
-    raw = doc.get("start_date")
-    out["start_date_raw"] = raw
-    out["start_date"] = normalize_start_date(raw)
+def load_code_map(kbo_dir: str | None = None, language: str = "FR") -> dict[tuple[str, str], str]:
+    """Charge code.csv → {(Category, Code): Description} pour la langue donnée."""
+    path = Path(kbo_dir or config.KBO_DATA_DIR) / "code.csv"
+    out: dict[tuple[str, str], str] = {}
+    if not path.is_file():
+        return out
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        for r in csv.DictReader(f):
+            if r.get("Language") == language:
+                out[(r.get("Category", ""), r.get("Code", ""))] = r.get("Description")
     return out
 
 
-def build_silver(batch_size: int = 5000, limit: int | None = None) -> dict:
+def _t(codes: dict, category: str, code: Any) -> str | None:
+    if not code or not category:
+        return None
+    return codes.get((category, str(code)))
+
+
+def dedup_activities(activities: list[dict]) -> list[dict]:
+    """Dédup par (nace_code, classification) — on ignore la version NACE.
+
+    Codes différents conservés (70220 vs 70200) ; MAIN/SECO/ANCI d'un même code conservés
+    (classification différente) ; on garde la 1re occurrence.
+    """
+    seen: set[tuple[str, str]] = set()
+    out: list[dict] = []
+    for a in activities:
+        code = (a.get("nace_code") or "").strip()
+        classification = (a.get("classification") or "").strip()
+        if not code:
+            continue
+        key = (code, classification)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(dict(a))
+    return out
+
+
+def order_denominations(denoms: list[dict]) -> list[dict]:
+    """Dénomination officielle (type 001) en premier, les autres ensuite (ordre stable)."""
+    official = [d for d in denoms if d.get("type") == OFFICIAL_DENOMINATION]
+    others = [d for d in denoms if d.get("type") != OFFICIAL_DENOMINATION]
+    return official + others
+
+
+def to_silver(doc: dict, codes: dict) -> dict:
+    """Transforme un doc bronze mergé en doc silver."""
+    out = dict(doc)
+    out.pop("_id", None)
+
+    # 1) date normalisée
+    raw = doc.get("start_date")
+    out["start_date_raw"] = raw
+    out["start_date"] = normalize_start_date(raw)
+
+    # 2) adresse : REGO uniquement
+    addr = doc.get("address")
+    out["address"] = addr if (addr and addr.get("type") == "REGO") else None
+
+    # 3) dénomination officielle en premier
+    out["denominations"] = order_denominations(doc.get("denominations") or [])
+
+    # 4) codes → labels (codes bruts conservés)
+    out["status_label"] = _t(codes, "Status", doc.get("status"))
+    out["juridical_situation_label"] = _t(codes, "JuridicalSituation", doc.get("juridical_situation"))
+    out["juridical_form_label"] = _t(codes, "JuridicalForm", doc.get("juridical_form"))
+    out["type_of_enterprise_label"] = _t(codes, "TypeOfEnterprise", doc.get("type_of_enterprise"))
+
+    # 5) activités : dédup + labels NACE
+    acts = dedup_activities(doc.get("activities") or [])
+    for a in acts:
+        a["nace_label"] = _t(codes, NACE_CATEGORY.get(a.get("nace_version") or "", ""), a.get("nace_code"))
+        a["classification_label"] = _t(codes, "Classification", a.get("classification"))
+        a["activity_group_label"] = _t(codes, "ActivityGroup", a.get("activity_group"))
+    out["activities"] = acts
+
+    # 6) établissements : date normalisée
+    for e in doc.get("establishments") or []:
+        e["start_date"] = normalize_start_date(e.get("start_date_raw"))
+
+    return out
+
+
+def build_silver(kbo_dir: str | None = None, batch_size: int = 5000, limit: int | None = None) -> dict:
+    codes = load_code_map(kbo_dir)
     client = MongoClient(config.MONGO_URI)
     db = client[config.MONGO_CATALOG_DB]
     src = db[SOURCE_COLLECTION]
@@ -69,7 +153,7 @@ def build_silver(batch_size: int = 5000, limit: int | None = None) -> dict:
         cursor = cursor.limit(limit)
     try:
         for doc in cursor:
-            s = to_silver(doc)
+            s = to_silver(doc, codes)
             s["silver_updated_at"] = now
             if s["start_date"] is None:
                 date_null += 1
@@ -88,85 +172,7 @@ def build_silver(batch_size: int = 5000, limit: int | None = None) -> dict:
         "processed": processed,
         "silver_count": dst.count_documents({}),
         "start_date_null": date_null,
-    }
-    client.close()
-    return stats
-
-
-#Activités NACE
-
-
-def dedup_activities(rows: list[dict]) -> list[dict]:
-    seen: set[tuple[str, str]] = set()
-    out: list[dict] = []
-    for r in rows:
-        code = (r.get("NaceCode") or "").strip()
-        classification = (r.get("Classification") or "").strip()
-        if not code:
-            continue
-        key = (code, classification)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append({
-            "nace_code": code,
-            "classification": classification,
-            "nace_version": (r.get("NaceVersion") or "").strip() or None,
-            "activity_group": (r.get("ActivityGroup") or "").strip() or None,
-        })
-    return out
-
-
-def _iter_entity_groups(activity_path: Path) -> Iterator[tuple[str, list[dict]]]:
-    """Streame activity.csv (trié par EntityNumber) et yield (entity, lignes)."""
-    with open(activity_path, encoding="utf-8-sig", newline="") as f:
-        current: str | None = None
-        buf: list[dict] = []
-        for row in csv.DictReader(f):
-            ent = row["EntityNumber"]
-            if current is None:
-                current = ent
-            if ent != current:
-                yield current, buf
-                current, buf = ent, []
-            buf.append(row)
-        if current is not None and buf:
-            yield current, buf
-
-
-def build_activities(kbo_dir: str | None = None, batch_size: int = 5000) -> dict:
-    """Embarque un tableau `activities` dédupliqué dans chaque doc silver existant."""
-    activity_path = Path(kbo_dir or config.KBO_DATA_DIR) / "activity.csv"
-    if not activity_path.is_file():
-        raise FileNotFoundError(f"Missing {activity_path}")
-
-    client = MongoClient(config.MONGO_URI)
-    dst = client[config.MONGO_CATALOG_DB][SILVER_COLLECTION]
-
-    now = datetime.now(timezone.utc)
-    entities = matched = total_acts = 0
-    ops: list[UpdateOne] = []
-    for entity, rows in _iter_entity_groups(activity_path):
-        acts = dedup_activities(rows)
-        if not acts:
-            continue
-        entities += 1
-        total_acts += len(acts)
-        bce = normalize_bce(entity)
-        ops.append(UpdateOne(
-            {"bce_number": bce},
-            {"$set": {"activities": acts, "activities_updated_at": now}},
-        ))
-        if len(ops) >= batch_size:
-            matched += dst.bulk_write(ops, ordered=False).matched_count
-            ops = []
-    if ops:
-        matched += dst.bulk_write(ops, ordered=False).matched_count
-
-    stats = {
-        "entities_with_activities": entities,
-        "matched_in_silver": matched,
-        "activities_embedded": total_acts,
+        "codes_loaded": len(codes),
     }
     client.close()
     return stats

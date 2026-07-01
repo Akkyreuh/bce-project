@@ -1,6 +1,6 @@
-"""Construit la collection entreprise_silver depuis le catalogue.
+"""Construit entreprise_silver depuis le bronze mergé (transformations).
 
-    python scripts/build_silver.py            # tout le catalogue
+    python scripts/build_silver.py
     python scripts/build_silver.py --limit 1000
 """
 
@@ -10,29 +10,26 @@ import argparse
 import sys
 from pathlib import Path
 
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from bce.silver import build_activities, build_silver
-
-
-def _show(stats: dict) -> None:
-    for k, v in stats.items():
-        print(f"  {k:24}: {v:,}" if isinstance(v, int) else f"  {k:24}: {v}")
+from bce.silver import build_silver
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Build entreprise_silver")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--batch-size", type=int, default=5000)
-    ap.add_argument("--no-activities", action="store_true", help="Ne pas embarquer les activités NACE")
     args = ap.parse_args()
 
-    print("1) Documents entreprise (start_date normalisée)…")
-    _show(build_silver(batch_size=args.batch_size, limit=args.limit))
-
-    if not args.no_activities:
-        print("\n2) Activités NACE (dédup NaceCode+Classification)…")
-        _show(build_activities(batch_size=args.batch_size))
+    print("Transformation bronze -> entreprise_silver...")
+    stats = build_silver(batch_size=args.batch_size, limit=args.limit)
+    for k, v in stats.items():
+        print(f"  {k:18}: {v:,}" if isinstance(v, int) else f"  {k:18}: {v}")
     return 0
 
 
